@@ -6,116 +6,161 @@ from datetime import datetime
 from bs4 import BeautifulSoup
 from scrapfly import ScrapflyClient, ScrapeConfig
 
-# --- Secrets from GitHub ---
+# --- Secrets ---
 SAPK = os.getenv('SAPK')
 TBK  = os.getenv('TBK')
 TCI  = json.loads(os.getenv('TCI', '[]'))
 MBL  = os.getenv('MBL')
 
-DB_FILE = "listings_db.json"
+# Store data in a JSON file (aligned with YML)
+DB_FILE = "listings.json"
 scrapfly = ScrapflyClient(key=SAPK)
 
-def p_prc(s):
+def parse_price(s):
     if not s: return 0
-    # Removes everything except digits (handles € 45.900 -> 45900)
+    # Handles € 45.900 -> 45900
     c = re.sub(r'[^\d]', '', str(s))
     return int(c) if c else 0
 
-def l_db():
+def load_db():
     if os.path.exists(DB_FILE):
         try:
             with open(DB_FILE, 'r') as f: return json.load(f)
         except: return {}
     return {}
 
-def s_db(d):
+def save_db(d):
     with open(DB_FILE, 'w') as f: json.dump(d, f, indent=4)
 
-def esc(t):
-    # Telegram MarkdownV2 requires escaping special characters
+def escape_md(t):
+    # Escape MarkdownV2 characters for Telegram
     chars = ['*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     t = str(t)
     for c in chars: t = t.replace(c, f'\\{c}')
     return t
 
-def s_tel(m):
-    for c_id in TCI:
-        u = f"https://api.telegram.org/bot{TBK}/sendMessage"
+def send_telegram(msg):
+    if not TBK or not TCI:
+        print("DEBUG: Telegram secrets missing.")
+        return
+    
+    url = f"https://api.telegram.org/bot{TBK}/sendMessage"
+    for chat_id in TCI:
         try:
-            requests.post(u, json={"chat_id": c_id, "text": m, "parse_mode": "MarkdownV2"}, timeout=10)
+            requests.post(url, json={
+                "chat_id": chat_id, 
+                "text": msg, 
+                "parse_mode": "MarkdownV2",
+                "disable_web_page_preview": False
+            }, timeout=10)
         except Exception as e:
             print(f"DEBUG: Telegram error: {e}")
 
 def run():
     print(f"DEBUG: Starting Scrape at {datetime.now()}")
     
-    # Execute scrape using your provided Scrapfly setup
-    result = scrapfly.scrape(ScrapeConfig(
-        url=MBL,
-        tags=["player", "project:default"],
-        asp=True,
-        render_js=True
-    ))
+    # Check if this is the very first run (no DB file)
+    first_run = not os.path.exists(DB_FILE)
+    
+    try:
+        result = scrapfly.scrape(ScrapeConfig(
+            url=MBL,
+            tags=["player", "project:default"],
+            asp=True,
+            render_js=True,
+            # Wait slightly for dynamic content
+            wait_for_selector="article"
+        ))
+    except Exception as e:
+        print(f"DEBUG: Scrapfly failed: {e}")
+        return
 
     soup = BeautifulSoup(result.content, 'html.parser')
     
-    # mobile.de uses 'article' tags for listings in their current webapp
-    listings = soup.find_all('article', {'data-testid': re.compile(r'adListing')})
+    # Find listings (mobile.de usually uses 'article' or specific classes)
+    listings = soup.find_all('article')
     
-    # Fallback if structure is slightly different
+    # Fallback for different layouts
     if not listings:
-        listings = soup.select('a[href*="details.html?id="]')
+        listings = soup.select('.c-result-list__item')
 
-    print(f"DEBUG: Found {len(listings)} potential listings in HTML.")
+    print(f"DEBUG: Found {len(listings)} potential listings.")
 
-    db = l_db()
-    upd = False
+    db = load_db()
+    updated = False
     
     for ad in listings:
-        # 1. Get the ID
+        # 1. Extract ID
         vid = ad.get('data-ad-id')
         if not vid:
-            # Try to find ID in the link if not in the article tag
-            link = ad.find('a', href=True) if ad.name == 'article' else ad
-            if link and 'id=' in link['href']:
-                vid = link['href'].split('id=')[1].split('&')[0]
+            # Try finding ID in anchor link
+            link_tag = ad.find('a', href=True)
+            if link_tag and 'id=' in link_tag['href']:
+                vid = link_tag['href'].split('id=')[1].split('&')[0]
         
         if not vid: continue
 
-        # 2. Get the Title
-        title_tag = ad.find('h2') or ad.find('div', {'class': re.compile(r'title')})
-        ttl = title_tag.get_text(strip=True) if title_tag else "Tesla Listing"
-
-        # 3. Get the Price
-        # Look for the span containing the price (usually has 'price' in data-testid)
+        # 2. Extract Price
         price_tag = ad.find('span', {'data-testid': re.compile(r'price')})
-        p_str = price_tag.get_text(strip=True) if price_tag else "Price on Request"
-        p_val = p_prc(p_str)
-
-        lnk = f"https://www.mobile.de/details.html?id={vid}"
-
-        # 4. Check against Database
-        if vid not in db:
-            print(f"DEBUG: New entry: {vid} - {ttl}")
-            # Format message for Telegram
-            msg = f"*New Tesla Found\\!*\n\n{esc(ttl)}\n💰 {esc(p_str)}\n\n[Open Listing]({lnk})"
-            s_tel(msg)
-            db[vid] = p_val
-            upd = True
+        if not price_tag:
+            # Fallback text search
+            text = ad.get_text()
+            price_match = re.search(r'€\s?[\d\.,]+', text)
+            price_str = price_match.group(0) if price_match else "Unknown Price"
         else:
-            # Price drop check
-            old_p = db.get(vid, 0)
-            if 0 < p_val < (old_p - 10): # Avoid notifying for 1 EUR changes
-                msg = f"*📉 Price Dropped\\!*\n\n{esc(ttl)}\nOld: {old_p} €\nNew: {esc(p_str)}\n\n[Open Listing]({lnk})"
-                s_tel(msg)
-                db[vid] = p_val
-                upd = True
+            price_str = price_tag.get_text(strip=True)
+            
+        price_val = parse_price(price_str)
 
-    if upd:
-        s_db(db)
-        print("DEBUG: Database updated with new listings.")
+        # 3. Extract Title
+        title_tag = ad.find('h2')
+        title = title_tag.get_text(strip=True) if title_tag else "Tesla Listing"
+
+        # 4. Correct Link Format (suchen.mobile.de)
+        link = f"https://suchen.mobile.de/fahrzeuge/details.html?id={vid}&lang=en"
+
+        # 5. Logic: New vs Existing
+        if vid not in db:
+            # Add to DB
+            db[vid] = price_val
+            updated = True
+            
+            # ONLY send notification if this is NOT the first run
+            # This prevents spamming 20 old cars on startup
+            if not first_run:
+                print(f"DEBUG: New listing found: {vid}")
+                msg = (
+                    f"*🆕 New Tesla Found\\!*\n\n"
+                    f"{escape_md(title)}\n"
+                    f"💰 *{escape_md(price_str)}*\n\n"
+                    f"[Open Listing]({link})"
+                )
+                send_telegram(msg)
+            else:
+                print(f"DEBUG: First run - Silently saving {vid}")
+
+        else:
+            # Check for Price Drop
+            old_price = db.get(vid, 0)
+            # Notify if price dropped by at least 100 EUR
+            if 0 < price_val < (old_price - 100):
+                print(f"DEBUG: Price drop on {vid}")
+                msg = (
+                    f"*📉 Price Drop\\!*\n\n"
+                    f"{escape_md(title)}\n"
+                    f"Old: ~{old_price} €~\n"
+                    f"New: *{escape_md(price_str)}*\n\n"
+                    f"[Open Listing]({link})"
+                )
+                send_telegram(msg)
+                db[vid] = price_val
+                updated = True
+
+    if updated or first_run:
+        save_db(db)
+        print("DEBUG: Database saved.")
     else:
-        print("DEBUG: No new listings found in this run.")
+        print("DEBUG: No changes detected.")
 
 if __name__ == "__main__":
     run()
