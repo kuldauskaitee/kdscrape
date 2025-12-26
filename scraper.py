@@ -12,13 +12,12 @@ TBK  = os.getenv('TBK')
 TCI  = json.loads(os.getenv('TCI', '[]'))
 MBL  = os.getenv('MBL')
 
-# Store data in a JSON file (aligned with YML)
 DB_FILE = "listings.json"
 scrapfly = ScrapflyClient(key=SAPK)
 
 def parse_price(s):
     if not s: return 0
-    # Handles € 45.900 -> 45900
+    # Remove all non-digits (handle € 45.900 -> 45900)
     c = re.sub(r'[^\d]', '', str(s))
     return int(c) if c else 0
 
@@ -33,16 +32,14 @@ def save_db(d):
     with open(DB_FILE, 'w') as f: json.dump(d, f, indent=4)
 
 def escape_md(t):
-    # Escape MarkdownV2 characters for Telegram
+    # Escape MarkdownV2 special characters
     chars = ['*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     t = str(t)
     for c in chars: t = t.replace(c, f'\\{c}')
     return t
 
 def send_telegram(msg):
-    if not TBK or not TCI:
-        print("DEBUG: Telegram secrets missing.")
-        return
+    if not TBK or not TCI: return
     
     url = f"https://api.telegram.org/bot{TBK}/sendMessage"
     for chat_id in TCI:
@@ -57,9 +54,10 @@ def send_telegram(msg):
             print(f"DEBUG: Telegram error: {e}")
 
 def run():
+    now_str = datetime.now().strftime("%Y-%m-%d")
     print(f"DEBUG: Starting Scrape at {datetime.now()}")
     
-    # Check if this is the very first run (no DB file)
+    # Check if this is the first run to avoid spamming
     first_run = not os.path.exists(DB_FILE)
     
     try:
@@ -68,7 +66,6 @@ def run():
             tags=["player", "project:default"],
             asp=True,
             render_js=True,
-            # Wait slightly for dynamic content
             wait_for_selector="article"
         ))
     except Exception as e:
@@ -76,11 +73,9 @@ def run():
         return
 
     soup = BeautifulSoup(result.content, 'html.parser')
-    
-    # Find listings (mobile.de usually uses 'article' or specific classes)
     listings = soup.find_all('article')
     
-    # Fallback for different layouts
+    # Fallback
     if not listings:
         listings = soup.select('.c-result-list__item')
 
@@ -93,7 +88,6 @@ def run():
         # 1. Extract ID
         vid = ad.get('data-ad-id')
         if not vid:
-            # Try finding ID in anchor link
             link_tag = ad.find('a', href=True)
             if link_tag and 'id=' in link_tag['href']:
                 vid = link_tag['href'].split('id=')[1].split('&')[0]
@@ -115,46 +109,79 @@ def run():
         # 3. Extract Title
         title_tag = ad.find('h2')
         title = title_tag.get_text(strip=True) if title_tag else "Tesla Listing"
+        
+        # 4. Extract "First Registration" (Year) if possible
+        # usually in a div like "2022 • 30.000 km"
+        meta_text = ""
+        meta_divs = ad.find_all('div', {'class': re.compile(r'subtitle|vehicle-data')})
+        for m in meta_divs:
+            meta_text += " " + m.get_text(strip=True)
+        
+        # Try to find a year (e.g. 2020, 2021) in text
+        year_match = re.search(r'20[1-3][0-9]', meta_text)
+        year_str = year_match.group(0) if year_match else "N/A"
 
-        # 4. Correct Link Format (suchen.mobile.de)
         link = f"https://suchen.mobile.de/fahrzeuge/details.html?id={vid}&lang=en"
 
-        # 5. Logic: New vs Existing
+        # --- LOGIC HANDLING ---
+
+        # Case A: New Car (ID not in DB)
         if vid not in db:
-            # Add to DB
-            db[vid] = price_val
+            # Create new record
+            db[vid] = {
+                "price": price_val,
+                "found_at": now_str,
+                "title": title
+            }
             updated = True
             
-            # ONLY send notification if this is NOT the first run
-            # This prevents spamming 20 old cars on startup
             if not first_run:
-                print(f"DEBUG: New listing found: {vid}")
+                print(f"DEBUG: New listing {vid}")
                 msg = (
                     f"*🆕 New Tesla Found\\!*\n\n"
                     f"{escape_md(title)}\n"
-                    f"💰 *{escape_md(price_str)}*\n\n"
+                    f"🗓 Year: {escape_md(year_str)}\n"
+                    f"💰 *{escape_md(price_str)}*\n"
+                    f"📅 Found: {escape_md(now_str)}\n\n"
                     f"[Open Listing]({link})"
                 )
                 send_telegram(msg)
-            else:
-                print(f"DEBUG: First run - Silently saving {vid}")
 
+        # Case B: Car exists, check Price Drop
         else:
-            # Check for Price Drop
-            old_price = db.get(vid, 0)
-            # Notify if price dropped by at least 100 EUR
-            if 0 < price_val < (old_price - 100):
-                print(f"DEBUG: Price drop on {vid}")
+            # Handle legacy DB format (if old json exists with just integers)
+            stored_data = db[vid]
+            if isinstance(stored_data, int):
+                old_price = stored_data
+                # Convert to new format
+                db[vid] = {"price": price_val, "found_at": now_str}
+            else:
+                old_price = stored_data.get("price", 0)
+
+            # Check drop (Must be at least 50 EUR difference to trigger)
+            if old_price > 0 and price_val < (old_price - 50):
+                print(f"DEBUG: Price drop on {vid}: {old_price} -> {price_val}")
+                
+                # Get the original found date if available
+                orig_date = stored_data.get("found_at", now_str) if isinstance(stored_data, dict) else now_str
+                
                 msg = (
                     f"*📉 Price Drop\\!*\n\n"
                     f"{escape_md(title)}\n"
                     f"Old: ~{old_price} €~\n"
-                    f"New: *{escape_md(price_str)}*\n\n"
+                    f"New: *{escape_md(price_str)}*\n"
+                    f"📅 Found: {escape_md(orig_date)}\n\n"
                     f"[Open Listing]({link})"
                 )
                 send_telegram(msg)
-                db[vid] = price_val
+                
+                # Update DB with new price
+                db[vid]["price"] = price_val
                 updated = True
+            
+            # If price increased or stayed same, do nothing (but ensure DB format is current)
+            if isinstance(stored_data, int):
+                updated = True # We updated the format
 
     if updated or first_run:
         save_db(db)
