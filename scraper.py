@@ -6,11 +6,21 @@ from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from scrapfly import ScrapflyClient, ScrapeConfig
 
-# --- Secrets ---
 SAPK = os.getenv('SAPK')
 TBK  = os.getenv('TBK')
-TCI  = json.loads(os.getenv('TCI', '[]'))
 MBL  = os.getenv('MBL')
+
+raw_tci = os.getenv('TCI', '[]')
+try:
+    loaded_tci = json.loads(raw_tci)
+    if isinstance(loaded_tci, int):
+        TCI = [loaded_tci]
+    elif isinstance(loaded_tci, list):
+        TCI = list(set(loaded_tci))
+    else:
+        TCI = []
+except:
+    TCI = []
 
 DB_FILE = "listings.json"
 scrapfly = ScrapflyClient(key=SAPK)
@@ -39,40 +49,32 @@ def escape_md(t):
 def send_telegram(msg):
     if not TBK or not TCI: return
     url = f"https://api.telegram.org/bot{TBK}/sendMessage"
+    
     for chat_id in TCI:
         try:
-            requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "MarkdownV2", "disable_web_page_preview": False})
+            requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "MarkdownV2", "disable_web_page_preview": False}, timeout=10)
         except Exception as e:
-            print(f"DEBUG: Telegram error: {e}")
+            print(f"Telegram error: {e}")
 
 def get_lithuania_time():
     return datetime.now(timezone.utc) + timedelta(hours=2)
 
 def check_upload_date(ad_soup):
-    """
-    Parses 'Ad online since' text.
-    Returns: (bool is_recent, str display_date)
-    """
     now = get_lithuania_time()
     today = now.date()
     yesterday = today - timedelta(days=1)
     
     text = ad_soup.get_text(" ", strip=True)
-
-    # Regex for "Ad online since 12/26/2025" or "Inserat online seit 26.12.2025"
     date_pattern = re.search(r'(?:Ad online since|Inserat online seit|Online since|Eingestellt am).*?(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', text, re.IGNORECASE)
     
     if date_pattern:
         date_str = date_pattern.group(1)
         parsed_date = None
         
-        # Try US Format
         try:
-            if "/" in date_str:
-                parsed_date = datetime.strptime(date_str, "%m/%d/%Y").date()
+            if "/" in date_str: parsed_date = datetime.strptime(date_str, "%m/%d/%Y").date()
         except: pass
         
-        # Try EU Format
         if not parsed_date:
             try:
                 clean_d = date_str.replace("-", ".")
@@ -81,10 +83,8 @@ def check_upload_date(ad_soup):
 
         if parsed_date:
             display_str = parsed_date.strftime("%Y-%m-%d")
-            if parsed_date >= yesterday:
-                return True, display_str
-            else:
-                return False, display_str
+            if parsed_date >= yesterday: return True, display_str
+            else: return False, display_str
 
     return False, "Unknown"
 
@@ -92,7 +92,7 @@ def run():
     lt_now = get_lithuania_time()
     now_str = lt_now.strftime("%Y-%m-%d %H:%M")
     
-    print(f"DEBUG: Starting Scrape at {now_str} (LT)")
+    print(f"Starting Scrape at {now_str} (LT)")
     
     first_run = not os.path.exists(DB_FILE)
     
@@ -104,7 +104,7 @@ def run():
             render_js=True
         ))
     except Exception as e:
-        print(f"DEBUG: Scrapfly failed: {e}")
+        print(f"Scrapfly failed: {e}")
         return
 
     soup = BeautifulSoup(result.content, 'html.parser')
@@ -113,14 +113,12 @@ def run():
     if not listings:
         listings = soup.select('a[href*="details.html?id="]')
 
-    print(f"DEBUG: Found {len(listings)} potential listings.")
+    print(f"Found {len(listings)} potential listings.")
 
     db = load_db()
     updated = False
     
-    # Track exactly what IDs we see in this run
-    seen_ids = []
-
+    unique_listings = {}
     for ad in listings:
         vid = ad.get('data-ad-id')
         if not vid:
@@ -128,10 +126,12 @@ def run():
             if link_elem and 'id=' in link_elem.get('href', ''):
                 vid = link_elem['href'].split('id=')[1].split('&')[0]
         
-        if not vid: continue
-        seen_ids.append(vid)
+        if vid:
+            unique_listings[vid] = ad
 
-        # Extract Price
+    for vid, ad in unique_listings.items():
+        is_recent, upload_date_str = check_upload_date(ad)
+
         price_tag = ad.find('span', {'data-testid': re.compile(r'price')})
         if price_tag:
             price_str = price_tag.get_text(strip=True)
@@ -142,17 +142,13 @@ def run():
         price_val = parse_price(price_str)
         link = f"https://suchen.mobile.de/fahrzeuge/details.html?id={vid}&lang=en"
 
-        # --- LOGIC ---
-        
-        # 1. NEW CAR FOUND
         if vid not in db:
-            is_recent, upload_date_str = check_upload_date(ad)
             db[vid] = {"price": price_val, "found_at": now_str}
             updated = True
             
             if not first_run:
                 if is_recent:
-                    print(f"DEBUG: New Valid Car {vid} (Date: {upload_date_str})")
+                    print(f"New Valid Car {vid} (Date: {upload_date_str})")
                     msg = (
                         f"*🆕 New Tesla Found\\!*\n\n"
                         f"💰 *{escape_md(price_str)}*\n"
@@ -161,37 +157,24 @@ def run():
                     )
                     send_telegram(msg)
                 else:
-                    print(f"DEBUG: Skipped {vid} - Too old ({upload_date_str})")
+                    print(f"Skipped {vid} - Too old ({upload_date_str})")
 
-        # 2. EXISTING CAR (Price Check)
         else:
-            # Safely get old price
             stored_data = db[vid]
-            if isinstance(stored_data, int): 
-                old_p = stored_data
-            else: 
-                old_p = stored_data.get("price", 0)
+            if isinstance(stored_data, int): old_p = stored_data
+            else: old_p = stored_data.get("price", 0)
 
-            # FORCE INTEGER COMPARISON
             price_val = int(price_val)
             old_p = int(old_p)
-
-            # DEBUG PRINT FOR COMPARISON
-            if old_p != price_val:
-                print(f"DEBUG: COMPARE ID {vid} || DB: {old_p} vs WEB: {price_val}")
-
-            # CHECK DIFFERENCE
             diff = price_val - old_p
 
-            # PRICE DROP (New is smaller than Old by > 50)
-            # Example: 45000 - 50000 = -5000.  -5000 < -50 is True.
             if diff < -50:
-                print(f"ACTION: Sending Drop Alert for {vid} (Diff: {diff})")
+                print(f"Sending Drop Alert for {vid} (Diff: {diff})")
                 msg = (
                     f"*📉 Price Drop\\!*\n\n"
                     f"Old: ~{old_p} €~\n"
                     f"New: *{escape_md(price_str)}*\n"
-                    f"📅 Detected: {escape_md(now_str)}\n\n"
+                    f"📅 Uploaded: {escape_md(upload_date_str)}\n\n"
                     f"[Open Listing]({link})"
                 )
                 send_telegram(msg)
@@ -200,15 +183,13 @@ def run():
                 else: db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
 
-            # PRICE INCREASE (New is bigger than Old by > 50)
-            # Example: 55000 - 50000 = 5000. 5000 > 50 is True.
             elif diff > 50:
-                print(f"ACTION: Sending Increase Alert for {vid} (Diff: {diff})")
+                print(f"Sending Increase Alert for {vid} (Diff: {diff})")
                 msg = (
                     f"*📈 Price Increased\\!*\n\n"
                     f"Old: ~{old_p} €~\n"
                     f"New: *{escape_md(price_str)}*\n"
-                    f"📅 Detected: {escape_md(now_str)}\n\n"
+                    f"📅 Uploaded: {escape_md(upload_date_str)}\n\n"
                     f"[Open Listing]({link})"
                 )
                 send_telegram(msg)
@@ -219,12 +200,9 @@ def run():
 
     if updated or first_run:
         save_db(db)
-        print("DEBUG: Database saved.")
+        print("Database saved.")
     else:
-        print("DEBUG: No changes detected.")
-    
-    # FINAL DEBUG: Print how many we actually checked
-    print(f"DEBUG: Total IDs checked this run: {len(seen_ids)}")
+        print("No changes detected.")
 
 if __name__ == "__main__":
     run()
