@@ -65,39 +65,64 @@ def run():
             tags=["player", "project:default"],
             asp=True,
             render_js=True,
-            wait_for_selector="article" 
+            wait_for_selector="body" # Wait for body to ensure load
         ))
     except Exception as e:
         print(f"DEBUG: Scrapfly failed: {e}")
         return
 
     soup = BeautifulSoup(result.content, 'html.parser')
+    
+    # DEBUG: Print page title to ensure we aren't blocked or on 404
+    print(f"DEBUG: Page Title: {soup.title.string if soup.title else 'No Title'}")
+
+    # --- AGGRESSIVE SELECTOR STRATEGY ---
+    # 1. Look for explicit ad articles
     listings = soup.find_all('article')
     
+    # 2. If 0, look for ANY link that goes to a car detail page
     if not listings:
-        listings = soup.select('.c-result-list__item')
+        print("DEBUG: 'article' tag not found. Trying Link Strategy...")
+        # Find all <a> tags that have 'details.html?id=' in the href
+        listings = soup.select('a[href*="details.html?id="]')
 
-    print(f"DEBUG: Found {len(listings)} potential listings in HTML.")
+    print(f"DEBUG: Found {len(listings)} potential listings.")
 
     db = load_db()
     updated = False
     
+    # Deduplicate: The Link Strategy might find the same car twice (image link + text link)
+    seen_in_run = set()
+
     for ad in listings:
         # 1. Extract ID
-        vid = ad.get('data-ad-id')
+        vid = ad.get('data-ad-id') # If it's an article
+        
+        # If it's a link (Strategy 2), extract from href
+        if not vid and ad.name == 'a' and 'href' in ad.attrs:
+             href = ad['href']
+             if 'id=' in href:
+                 vid = href.split('id=')[1].split('&')[0]
+
+        # Try inner link if ad is an article container
         if not vid:
             link_tag = ad.find('a', href=True)
             if link_tag and 'id=' in link_tag['href']:
                 vid = link_tag['href'].split('id=')[1].split('&')[0]
         
         if not vid: continue
+        if vid in seen_in_run: continue # Skip duplicate on same page
+        seen_in_run.add(vid)
 
         # 2. Extract Price
+        # Try finding a price inside the element
         price_tag = ad.find('span', {'data-testid': re.compile(r'price')})
         if not price_tag:
+            # Look wider if we are just on a link element
+            # If 'ad' is just an <a> tag, we might need to look at its parent or text
             text = ad.get_text()
             price_match = re.search(r'€\s?[\d\.,]+', text)
-            price_str = price_match.group(0) if price_match else "Unknown"
+            price_str = price_match.group(0) if price_match else "Check Link"
         else:
             price_str = price_tag.get_text(strip=True)
             
@@ -105,12 +130,16 @@ def run():
 
         # 3. Extract Title
         title_tag = ad.find('h2')
-        title = title_tag.get_text(strip=True) if title_tag else "Tesla Listing"
-        
+        if title_tag:
+            title = title_tag.get_text(strip=True)
+        else:
+            # If we matched a link, the title might be the link text
+            title = ad.get_text(strip=True) or "Tesla Listing"
+            # Clean up title if it captured too much text
+            if len(title) > 50: title = title[:50] + "..."
+
         # 4. Extract Year
-        meta_text = ""
-        meta_divs = ad.find_all('div', {'class': re.compile(r'subtitle|vehicle-data')})
-        for m in meta_divs: meta_text += " " + m.get_text(strip=True)
+        meta_text = ad.get_text()
         year_match = re.search(r'20[1-3][0-9]', meta_text)
         year_str = year_match.group(0) if year_match else "N/A"
 
@@ -142,25 +171,23 @@ def run():
         # If Existing Car (Check Price)
         else:
             stored_data = db[vid]
-            # Handle format migration (int -> dict)
+            # Handle format migration
             if isinstance(stored_data, int):
                 old_price = stored_data
                 orig_date = now_str
-                db[vid] = {"price": price_val, "found_at": now_str} # Upgrade DB format
+                db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
             else:
                 old_price = stored_data.get("price", 0)
                 orig_date = stored_data.get("found_at", now_str)
 
-            # --- DEBUG LOGGING FOR YOU ---
-            # This will show you exactly what the bot sees
-            if old_price != price_val:
-                print(f"DEBUG: Price diff for {vid} | Old: {old_price} | New: {price_val}")
+            # --- DEBUG: Force check this specific ID ---
+            # Remove this if-block later if logs get too spammy
+            # print(f"DEBUG: Checking {vid}: {old_price} vs {price_val}")
 
             # PRICE DROP CHECK
-            # Must be valid prices, and drop > 50 EUR
             if old_price > 0 and price_val > 0 and price_val < (old_price - 50):
-                print(f"ACTION: Sending Alert for {vid}")
+                print(f"ACTION: Sending Alert for {vid} (Drop: {old_price} -> {price_val})")
                 msg = (
                     f"*📉 Price Drop\\!*\n\n"
                     f"{escape_md(title)}\n"
@@ -173,9 +200,9 @@ def run():
                 db[vid]["price"] = price_val
                 updated = True
 
-            # PRICE INCREASE CHECK (Update DB but don't spam Telegram)
+            # PRICE INCREASE CHECK
             elif price_val > (old_price + 50):
-                print(f"DEBUG: Price increased for {vid}. Updating DB.")
+                print(f"DEBUG: Price increased for {vid} ({old_price} -> {price_val})")
                 db[vid]["price"] = price_val
                 updated = True
 
