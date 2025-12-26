@@ -1,0 +1,30 @@
+name: System Monitor
+
+on:
+  schedule:
+    - cron: '*/5 9-1 * * *'
+  workflow_dispatch:
+
+jobs:
+  run-module:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+      - run: pip install scrapfly-sdk requests
+      - name: Execution
+        env:
+          SAPK: ${{ secrets.SAPK }}
+          TBK: ${{ secrets.TBK }}
+          TCI: ${{ secrets.TCI }}
+          MBL: ${{ secrets.MBL }}
+        run: python scraper.py
+      - name: Save State
+        uses: stefanzweifel/git-auto-commit-action@v5
+        with:
+          commit_message: "sys-update [skip ci]"
+          file_pattern: 'listings_db.json'
