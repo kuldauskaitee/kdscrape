@@ -17,7 +17,7 @@ scrapfly = ScrapflyClient(key=SAPK)
 
 def parse_price(s):
     if not s: return 0
-    # Remove all non-digits (handle € 45.900 -> 45900)
+    # Clean string: "€ 45.900" -> 45900
     c = re.sub(r'[^\d]', '', str(s))
     return int(c) if c else 0
 
@@ -32,7 +32,6 @@ def save_db(d):
     with open(DB_FILE, 'w') as f: json.dump(d, f, indent=4)
 
 def escape_md(t):
-    # Escape MarkdownV2 special characters
     chars = ['*', '_', '[', ']', '(', ')', '~', '`', '>', '#', '+', '-', '=', '|', '{', '}', '.', '!']
     t = str(t)
     for c in chars: t = t.replace(c, f'\\{c}')
@@ -40,16 +39,10 @@ def escape_md(t):
 
 def send_telegram(msg):
     if not TBK or not TCI: return
-    
     url = f"https://api.telegram.org/bot{TBK}/sendMessage"
     for chat_id in TCI:
         try:
-            requests.post(url, json={
-                "chat_id": chat_id, 
-                "text": msg, 
-                "parse_mode": "MarkdownV2",
-                "disable_web_page_preview": False
-            }, timeout=10)
+            requests.post(url, json={"chat_id": chat_id, "text": msg, "parse_mode": "MarkdownV2", "disable_web_page_preview": False})
         except Exception as e:
             print(f"DEBUG: Telegram error: {e}")
 
@@ -60,12 +53,12 @@ def run():
     first_run = not os.path.exists(DB_FILE)
     
     try:
+        # Standard scrape (No country lock, as requested)
         result = scrapfly.scrape(ScrapeConfig(
             url=MBL,
             tags=["player", "project:default"],
             asp=True,
-            render_js=True,
-            wait_for_selector="body" # Wait for body to ensure load
+            render_js=True
         ))
     except Exception as e:
         print(f"DEBUG: Scrapfly failed: {e}")
@@ -73,17 +66,12 @@ def run():
 
     soup = BeautifulSoup(result.content, 'html.parser')
     
-    # DEBUG: Print page title to ensure we aren't blocked or on 404
-    print(f"DEBUG: Page Title: {soup.title.string if soup.title else 'No Title'}")
-
-    # --- AGGRESSIVE SELECTOR STRATEGY ---
-    # 1. Look for explicit ad articles
-    listings = soup.find_all('article')
+    # --- SELECTOR STRATEGY (Restored from your working version) ---
+    # 1. Primary: Mobile.de standard ad listing tag
+    listings = soup.find_all('article', {'data-testid': re.compile(r'adListing')})
     
-    # 2. If 0, look for ANY link that goes to a car detail page
+    # 2. Fallback: Any link with a listing ID
     if not listings:
-        print("DEBUG: 'article' tag not found. Trying Link Strategy...")
-        # Find all <a> tags that have 'details.html?id=' in the href
         listings = soup.select('a[href*="details.html?id="]')
 
     print(f"DEBUG: Found {len(listings)} potential listings.")
@@ -91,119 +79,87 @@ def run():
     db = load_db()
     updated = False
     
-    # Deduplicate: The Link Strategy might find the same car twice (image link + text link)
-    seen_in_run = set()
-
     for ad in listings:
-        # 1. Extract ID
-        vid = ad.get('data-ad-id') # If it's an article
-        
-        # If it's a link (Strategy 2), extract from href
-        if not vid and ad.name == 'a' and 'href' in ad.attrs:
-             href = ad['href']
-             if 'id=' in href:
-                 vid = href.split('id=')[1].split('&')[0]
-
-        # Try inner link if ad is an article container
+        # --- DATA EXTRACTION ---
+        vid = ad.get('data-ad-id')
         if not vid:
-            link_tag = ad.find('a', href=True)
-            if link_tag and 'id=' in link_tag['href']:
-                vid = link_tag['href'].split('id=')[1].split('&')[0]
+            # Try to fish ID out of the link
+            link_elem = ad.find('a', href=True) if ad.name == 'article' else ad
+            if link_elem and 'id=' in link_elem.get('href', ''):
+                vid = link_elem['href'].split('id=')[1].split('&')[0]
         
         if not vid: continue
-        if vid in seen_in_run: continue # Skip duplicate on same page
-        seen_in_run.add(vid)
 
-        # 2. Extract Price
-        # Try finding a price inside the element
+        # Price
         price_tag = ad.find('span', {'data-testid': re.compile(r'price')})
-        if not price_tag:
-            # Look wider if we are just on a link element
-            # If 'ad' is just an <a> tag, we might need to look at its parent or text
-            text = ad.get_text()
-            price_match = re.search(r'€\s?[\d\.,]+', text)
-            price_str = price_match.group(0) if price_match else "Check Link"
-        else:
+        if price_tag:
             price_str = price_tag.get_text(strip=True)
-            
+        else:
+            p_match = re.search(r'€\s?[\d\.,]+', ad.get_text())
+            price_str = p_match.group(0) if p_match else "0"
+        
         price_val = parse_price(price_str)
 
-        # 3. Extract Title
-        title_tag = ad.find('h2')
-        if title_tag:
-            title = title_tag.get_text(strip=True)
-        else:
-            # If we matched a link, the title might be the link text
-            title = ad.get_text(strip=True) or "Tesla Listing"
-            # Clean up title if it captured too much text
-            if len(title) > 50: title = title[:50] + "..."
-
-        # 4. Extract Year
-        meta_text = ad.get_text()
-        year_match = re.search(r'20[1-3][0-9]', meta_text)
-        year_str = year_match.group(0) if year_match else "N/A"
+        # Title
+        t_tag = ad.find('h2') or ad.find('div', {'class': re.compile(r'title')})
+        title = t_tag.get_text(strip=True) if t_tag else "Tesla Listing"
+        
+        # Year
+        y_match = re.search(r'20[1-3][0-9]', ad.get_text())
+        year_str = y_match.group(0) if y_match else "N/A"
 
         link = f"https://suchen.mobile.de/fahrzeuge/details.html?id={vid}&lang=en"
 
-        # --- LOGIC HANDLING ---
-
-        # If New Car
+        # --- LOGIC ---
+        
+        # NEW CAR
         if vid not in db:
-            db[vid] = {
-                "price": price_val,
-                "found_at": now_str,
-                "title": title
-            }
+            db[vid] = {"price": price_val, "found_at": now_str, "title": title}
             updated = True
             
+            # Send alert only if it's not the initial database build
             if not first_run:
-                print(f"DEBUG: New listing {vid}")
-                msg = (
-                    f"*🆕 New Tesla Found\\!*\n\n"
-                    f"{escape_md(title)}\n"
-                    f"🗓 Year: {escape_md(year_str)}\n"
-                    f"💰 *{escape_md(price_str)}*\n"
-                    f"📅 Found: {escape_md(now_str)}\n\n"
-                    f"[Open Listing]({link})"
-                )
+                print(f"DEBUG: New Car {vid}")
+                msg = f"*🆕 New Tesla Found\\!*\n\n{escape_md(title)}\n🗓 Year: {escape_md(year_str)}\n💰 *{escape_md(price_str)}*\n📅 Found: {escape_md(now_str)}\n\n[Open Listing]({link})"
                 send_telegram(msg)
 
-        # If Existing Car (Check Price)
+        # EXISTING CAR (The part that was failing)
         else:
             stored_data = db[vid]
-            # Handle format migration
+            
+            # 1. Normalize Old Price
             if isinstance(stored_data, int):
-                old_price = stored_data
-                orig_date = now_str
-                db[vid] = {"price": price_val, "found_at": now_str}
-                updated = True
+                old_p = stored_data
+                orig_d = now_str
             else:
-                old_price = stored_data.get("price", 0)
-                orig_date = stored_data.get("found_at", now_str)
+                old_p = stored_data.get("price", 0)
+                orig_d = stored_data.get("found_at", now_str)
 
-            # --- DEBUG: Force check this specific ID ---
-            # Remove this if-block later if logs get too spammy
-            # print(f"DEBUG: Checking {vid}: {old_price} vs {price_val}")
+            # 2. DEBUG PRINT (This will prove if it's checking)
+            if old_p != price_val:
+                print(f"CHECK: {vid} | DB: {old_p} -> Web: {price_val}")
 
-            # PRICE DROP CHECK
-            if old_price > 0 and price_val > 0 and price_val < (old_price - 50):
-                print(f"ACTION: Sending Alert for {vid} (Drop: {old_price} -> {price_val})")
-                msg = (
-                    f"*📉 Price Drop\\!*\n\n"
-                    f"{escape_md(title)}\n"
-                    f"Old: ~{old_price} €~\n"
-                    f"New: *{escape_md(price_str)}*\n"
-                    f"📅 Found: {escape_md(orig_date)}\n\n"
-                    f"[Open Listing]({link})"
-                )
+            # 3. Price Drop Logic
+            #    Triggers if current price is lower than DB price by > 50
+            if old_p > 0 and price_val > 0 and price_val < (old_p - 50):
+                print(f"ACTION: Sending Drop Alert for {vid}")
+                msg = f"*📉 Price Drop\\!*\n\n{escape_md(title)}\nOld: ~{old_p} €~\nNew: *{escape_md(price_str)}*\n📅 Found: {escape_md(orig_d)}\n\n[Open Listing]({link})"
                 send_telegram(msg)
-                db[vid]["price"] = price_val
+                
+                # Update DB
+                if isinstance(db[vid], dict):
+                    db[vid]["price"] = price_val
+                else:
+                    db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
 
-            # PRICE INCREASE CHECK
-            elif price_val > (old_price + 50):
-                print(f"DEBUG: Price increased for {vid} ({old_price} -> {price_val})")
-                db[vid]["price"] = price_val
+            # 4. Price Increase Logic (Update DB silently)
+            elif price_val > (old_p + 50):
+                print(f"DEBUG: Price increased {vid}. Updating DB.")
+                if isinstance(db[vid], dict):
+                    db[vid]["price"] = price_val
+                else:
+                    db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
 
     if updated or first_run:
