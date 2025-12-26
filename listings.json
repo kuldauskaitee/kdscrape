@@ -113,5 +113,20 @@
         "price": 19965,
         "found_at": "2025-12-26",
         "title": "Tesla Model YLong Range RWD"
+    },
+    "444151736": {
+        "price": 27800,
+        "found_at": "2025-12-26",
+        "title": "GesponsertTesla Model YLong Range Dual AWD, 1HAND"
+    },
+    "389769009": {
+        "price": 22980,
+        "found_at": "2025-12-26",
+        "title": "GesponsertTesla Model 3366kW AWD 4x4 Dualmotor Long Range 82kWh"
+    },
+    "441332930": {
+        "price": 24079,
+        "found_at": "2025-12-26",
+        "title": "GesponsertTesla Model S100D P 568kW Ludicrous+"
     }
 }
