@@ -37,36 +37,45 @@ def esc(t):
     return t
 
 def s_tel(m):
+    print(f"DEBUG: Attempting to send Telegram message to {len(TCI)} IDs")
     for c_id in TCI:
         u = f"https://api.telegram.org/bot{TBK}/sendMessage"
-        try: requests.post(u, json={"chat_id": c_id, "text": m, "parse_mode": "MarkdownV2"}, timeout=10)
-        except: pass
-
-def is_r(d_s):
-    if not d_s: return False
-    try:
-        c_d = d_s.split(',')[0].strip()
-        l_d = datetime.strptime(c_d, "%d.%m.%Y").date()
-        y = datetime.now().date() - timedelta(days=1)
-        return l_d >= y
-    except: return False
+        try: 
+            r = requests.post(u, json={"chat_id": c_id, "text": m, "parse_mode": "MarkdownV2"}, timeout=10)
+            print(f"DEBUG: Telegram response: {r.status_code}")
+        except Exception as e: 
+            print(f"DEBUG: Telegram Error: {e}")
 
 def run():
-    res: SA = cl.scrape(SG(
-        url=MBL,
-        tags=["player", "project:default"],
-        asp=True,
-        render_js=True,
-        country="de"
-    ))
+    print(f"DEBUG: Starting Scrape at {datetime.now()}")
+    if not MBL:
+        print("DEBUG: ERROR - MBL URL is empty! Check your Secrets.")
+        return
+
+    try:
+        res: SA = cl.scrape(SG(
+            url=MBL,
+            tags=["player", "project:default"],
+            asp=True,
+            render_js=True,
+            country="de"
+        ))
+        print(f"DEBUG: Scrapfly Success. Status: {res.status_code}")
+    except Exception as e:
+        print(f"DEBUG: Scrapfly Error: {e}")
+        return
     
     match = re.search(r'window\.__INITIAL_STATE__\s*=\s*(\{.*?\});', res.content)
-    if not match: return
+    if not match:
+        print("DEBUG: Could not find car data on the page. Mobile.de might have changed their layout.")
+        return
 
     data = json.loads(match.group(1))
-    items = data.get('search', {}).get('srp', {}).get('data', {}).get('searchResults', {}).get('items', [])
-    if not items:
-        items = data.get('search', {}).get('srp', {}).get('searchResults', {}).get('items', [])
+    # Trying different data paths for Mobile.de
+    items = (data.get('search', {}).get('srp', {}).get('data', {}).get('searchResults', {}).get('items', []) or 
+             data.get('search', {}).get('srp', {}).get('searchResults', {}).get('items', []))
+    
+    print(f"DEBUG: Found {len(items)} total items on page.")
 
     db = l_db()
     upd = False
@@ -79,34 +88,21 @@ def run():
         p_d = i.get('price', {}).get('gross', 'N/A')
         p_v = p_prc(p_d)
         
-        a = i.get('attr', {})
-        reg = a.get('fr', 'N/A')
-        ml = a.get('ml', 'N/A')
-        ons = i.get('onlineSince', '')
         r_u = i.get('relativeUrl', '')
         lnk = f"https://suchen.mobile.de{r_u}"
 
         if vid not in db:
-            if is_r(ons):
-                msg = (f"*New Listing\\!*\n\n*{esc(ttl)}*\n"
-                       f"Price: {esc(str(p_d))}\n"
-                       f"Reg: {esc(str(reg))} | {esc(str(ml))}\n"
-                       f"[Link]({lnk})")
-                s_tel(msg)
+            print(f"DEBUG: Found New Car: {ttl}")
+            msg = f"*New Listing\\!*\n\n*{esc(ttl)}*\nPrice: {esc(str(p_d))}\n[Link]({lnk})"
+            s_tel(msg)
             db[vid] = p_v
             upd = True
-        else:
-            old = db.get(vid, 0)
-            if 0 < p_v < old:
-                diff = old - p_v
-                msg = (f"*📉 Price Drop\\!*\n\n*{esc(ttl)}*\n"
-                       f"Old: € {old:,.0f}\nNew: {esc(str(p_d))}\n"
-                       f"Saved: € {diff:,.0f}\n[Link]({lnk})")
-                s_tel(msg)
-                db[vid] = p_v
-                upd = True
-
-    if upd: s_db(db)
+            
+    if upd: 
+        print("DEBUG: Saving new data to listings_db.json")
+        s_db(db)
+    else:
+        print("DEBUG: No new cars found to save.")
 
 if __name__ == "__main__":
     run()
