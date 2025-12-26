@@ -65,26 +65,39 @@ def check_upload_date(ad_soup):
     yesterday = today - timedelta(days=1)
     
     text = ad_soup.get_text(" ", strip=True)
-    date_pattern = re.search(r'(?:Ad online since|Inserat online seit|Online since|Eingestellt am).*?(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', text, re.IGNORECASE)
+    
+    # Regex captures Date AND optional Time (e.g. "12/26/2025, 16:31" or "26.12.2025 16:31")
+    # Group 1: Date + Time string
+    date_pattern = re.search(r'(?:Ad online since|Inserat online seit|Online since|Eingestellt am).*?(\d{1,2}[./-]\d{1,2}[./-]\d{2,4}(?:[\s,]+\d{1,2}:\d{2})?)', text, re.IGNORECASE)
     
     if date_pattern:
-        date_str = date_pattern.group(1)
-        parsed_date = None
+        raw_str = date_pattern.group(1).strip()
+        parsed_dt = None
         
-        try:
-            if "/" in date_str: parsed_date = datetime.strptime(date_str, "%m/%d/%Y").date()
-        except: pass
-        
-        if not parsed_date:
-            try:
-                clean_d = date_str.replace("-", ".")
-                parsed_date = datetime.strptime(clean_d, "%d.%m.%Y").date()
-            except: pass
+        # Define formats to try (with and without time)
+        formats = [
+            "%m/%d/%Y, %H:%M", "%m/%d/%Y %H:%M", "%m/%d/%Y",
+            "%d.%m.%Y, %H:%M", "%d.%m.%Y %H:%M", "%d.%m.%Y",
+            "%d-%m-%Y, %H:%M", "%d-%m-%Y %H:%M", "%d-%m-%Y"
+        ]
 
-        if parsed_date:
-            display_str = parsed_date.strftime("%Y-%m-%d")
-            if parsed_date >= yesterday: return True, display_str
-            else: return False, display_str
+        for fmt in formats:
+            try:
+                parsed_dt = datetime.strptime(raw_str, fmt)
+                break 
+            except:
+                continue
+        
+        if parsed_dt:
+            # Check if time was actually parsed (if hour/min are 0 and input didn't have 00:00, it might be date only)
+            # If valid, format nicely: "2025-12-26 16:31"
+            display_str = parsed_dt.strftime("%Y-%m-%d %H:%M")
+            
+            # Compare dates (ignore time for the "is recent" check to be safe)
+            if parsed_dt.date() >= yesterday:
+                return True, display_str
+            else:
+                return False, display_str
 
     return False, "Unknown"
 
