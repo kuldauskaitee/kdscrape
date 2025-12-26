@@ -2,11 +2,10 @@ import os
 import json
 import re
 import requests
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
 from bs4 import BeautifulSoup
 from scrapfly import ScrapflyClient, ScrapeConfig
 
-# --- Secrets ---
 SAPK = os.getenv('SAPK')
 TBK  = os.getenv('TBK')
 TCI  = json.loads(os.getenv('TCI', '[]'))
@@ -17,7 +16,6 @@ scrapfly = ScrapflyClient(key=SAPK)
 
 def parse_price(s):
     if not s: return 0
-    # Clean string: "€ 45.900" -> 45900
     c = re.sub(r'[^\d]', '', str(s))
     return int(c) if c else 0
 
@@ -46,14 +44,60 @@ def send_telegram(msg):
         except Exception as e:
             print(f"DEBUG: Telegram error: {e}")
 
+def get_real_time():
+    return datetime.now(timezone.utc) + timedelta(hours=2)
+
+def is_recent_upload(ad_soup):
+    """
+    Parses 'Ad online since' or 'Inserat online seit' text.
+    Returns: (bool is_recent, str reason)
+    """
+    now = get_real_time()
+    today = now.date()
+    yesterday = today - timedelta(days=1)
+    
+    text = ad_soup.get_text(" ", strip=True)
+
+    # Regex to find: "Ad online since 12/26/2025" or "Inserat online seit 26.12.2025"
+    # Matches: Keyword + junk space + Date
+    # Date pattern: Digits + separator + Digits + separator + Digits
+    date_pattern = re.search(r'(?:Ad online since|Inserat online seit|Online since|Eingestellt am).*?(\d{1,2}[./-]\d{1,2}[./-]\d{2,4})', text, re.IGNORECASE)
+    
+    if date_pattern:
+        date_str = date_pattern.group(1)
+        parsed_date = None
+        
+        # Try US Format first (MM/DD/YYYY) - Common if using US proxy/GitHub
+        try:
+            if "/" in date_str:
+                parsed_date = datetime.strptime(date_str, "%m/%d/%Y").date()
+        except: pass
+        
+        # Try German/EU Format (DD.MM.YYYY)
+        if not parsed_date:
+            try:
+                # Replace dots/dashes to standard format if needed
+                clean_d = date_str.replace("-", ".")
+                parsed_date = datetime.strptime(clean_d, "%d.%m.%Y").date()
+            except: pass
+
+        if parsed_date:
+            if parsed_date >= yesterday:
+                return True, f"Fresh Date: {parsed_date}"
+            else:
+                return False, f"Old Date: {parsed_date}"
+
+    return False, "No Date Text Found"
+
 def run():
-    now_str = datetime.now().strftime("%Y-%m-%d")
-    print(f"DEBUG: Starting Scrape at {datetime.now()}")
+    lt_now = get_real_time()
+    now_str = lt_now.strftime("%Y-%m-%d %H:%M") # e.g. 2025-12-26 18:30
+    
+    print(f"DEBUG: Starting Scrape at {now_str} (LT)")
     
     first_run = not os.path.exists(DB_FILE)
     
     try:
-        # Standard scrape (No country lock, as requested)
         result = scrapfly.scrape(ScrapeConfig(
             url=MBL,
             tags=["player", "project:default"],
@@ -66,11 +110,8 @@ def run():
 
     soup = BeautifulSoup(result.content, 'html.parser')
     
-    # --- SELECTOR STRATEGY (Restored from your working version) ---
-    # 1. Primary: Mobile.de standard ad listing tag
+    # Selectors
     listings = soup.find_all('article', {'data-testid': re.compile(r'adListing')})
-    
-    # 2. Fallback: Any link with a listing ID
     if not listings:
         listings = soup.select('a[href*="details.html?id="]')
 
@@ -80,17 +121,16 @@ def run():
     updated = False
     
     for ad in listings:
-        # --- DATA EXTRACTION ---
+        # Extract ID
         vid = ad.get('data-ad-id')
         if not vid:
-            # Try to fish ID out of the link
             link_elem = ad.find('a', href=True) if ad.name == 'article' else ad
             if link_elem and 'id=' in link_elem.get('href', ''):
                 vid = link_elem['href'].split('id=')[1].split('&')[0]
         
         if not vid: continue
 
-        # Price
+        # Extract Price
         price_tag = ad.find('span', {'data-testid': re.compile(r'price')})
         if price_tag:
             price_str = price_tag.get_text(strip=True)
@@ -99,67 +139,69 @@ def run():
             price_str = p_match.group(0) if p_match else "0"
         
         price_val = parse_price(price_str)
-
-        # Title
-        t_tag = ad.find('h2') or ad.find('div', {'class': re.compile(r'title')})
-        title = t_tag.get_text(strip=True) if t_tag else "Tesla Listing"
-        
-        # Year
-        y_match = re.search(r'20[1-3][0-9]', ad.get_text())
-        year_str = y_match.group(0) if y_match else "N/A"
-
         link = f"https://suchen.mobile.de/fahrzeuge/details.html?id={vid}&lang=en"
 
         # --- LOGIC ---
         
-        # NEW CAR
+        # NEW CAR FOUND
         if vid not in db:
-            db[vid] = {"price": price_val, "found_at": now_str, "title": title}
+            # STRICT DATE CHECK
+            is_recent, reason = is_recent_upload(ad)
+            
+            # Save to DB to avoid re-scanning old cars next time
+            db[vid] = {"price": price_val, "found_at": now_str}
             updated = True
             
-            # Send alert only if it's not the initial database build
+            # Only Notify if NOT first run AND Car is FRESH
             if not first_run:
-                print(f"DEBUG: New Car {vid}")
-                msg = f"*🆕 New Tesla Found\\!*\n\n{escape_md(title)}\n🗓 Year: {escape_md(year_str)}\n💰 *{escape_md(price_str)}*\n📅 Found: {escape_md(now_str)}\n\n[Open Listing]({link})"
-                send_telegram(msg)
+                if is_recent:
+                    print(f"DEBUG: New Valid Car {vid} ({reason})")
+                    msg = (
+                        f"*🆕 New Tesla Found\\!*\n\n"
+                        f"💰 *{escape_md(price_str)}*\n"
+                        f"📅 Found: {escape_md(now_str)}\n\n"
+                        f"[Open Listing]({link})"
+                    )
+                    send_telegram(msg)
+                else:
+                    # Log why we skipped it
+                    print(f"DEBUG: Skipped {vid} - {reason}")
 
-        # EXISTING CAR (The part that was failing)
+        # EXISTING CAR (Check Price)
         else:
             stored_data = db[vid]
-            
-            # 1. Normalize Old Price
+            # Handle old DB format
             if isinstance(stored_data, int):
                 old_p = stored_data
-                orig_d = now_str
             else:
                 old_p = stored_data.get("price", 0)
-                orig_d = stored_data.get("found_at", now_str)
 
-            # 2. DEBUG PRINT (This will prove if it's checking)
+            # Debug check
             if old_p != price_val:
                 print(f"CHECK: {vid} | DB: {old_p} -> Web: {price_val}")
 
-            # 3. Price Drop Logic
-            #    Triggers if current price is lower than DB price by > 50
+            # PRICE DROP (> 50 EUR)
             if old_p > 0 and price_val > 0 and price_val < (old_p - 50):
                 print(f"ACTION: Sending Drop Alert for {vid}")
-                msg = f"*📉 Price Drop\\!*\n\n{escape_md(title)}\nOld: ~{old_p} €~\nNew: *{escape_md(price_str)}*\n📅 Found: {escape_md(orig_d)}\n\n[Open Listing]({link})"
+                # For drops, we send alert regardless of "Ad Online Since" date, 
+                # because the Price Drop Event happened NOW.
+                msg = (
+                    f"*📉 Price Drop\\!*\n\n"
+                    f"Old: ~{old_p} €~\n"
+                    f"New: *{escape_md(price_str)}*\n"
+                    f"📅 Found: {escape_md(now_str)}\n\n"
+                    f"[Open Listing]({link})"
+                )
                 send_telegram(msg)
                 
-                # Update DB
-                if isinstance(db[vid], dict):
-                    db[vid]["price"] = price_val
-                else:
-                    db[vid] = {"price": price_val, "found_at": now_str}
+                if isinstance(db[vid], dict): db[vid]["price"] = price_val
+                else: db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
 
-            # 4. Price Increase Logic (Update DB silently)
+            # PRICE INCREASE (Update DB silently)
             elif price_val > (old_p + 50):
-                print(f"DEBUG: Price increased {vid}. Updating DB.")
-                if isinstance(db[vid], dict):
-                    db[vid]["price"] = price_val
-                else:
-                    db[vid] = {"price": price_val, "found_at": now_str}
+                if isinstance(db[vid], dict): db[vid]["price"] = price_val
+                else: db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
 
     if updated or first_run:
