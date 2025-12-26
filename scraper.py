@@ -66,13 +66,13 @@ def check_upload_date(ad_soup):
         date_str = date_pattern.group(1)
         parsed_date = None
         
-        # Try US Format (MM/DD/YYYY)
+        # Try US Format
         try:
             if "/" in date_str:
                 parsed_date = datetime.strptime(date_str, "%m/%d/%Y").date()
         except: pass
         
-        # Try EU Format (DD.MM.YYYY)
+        # Try EU Format
         if not parsed_date:
             try:
                 clean_d = date_str.replace("-", ".")
@@ -80,9 +80,7 @@ def check_upload_date(ad_soup):
             except: pass
 
         if parsed_date:
-            # We return the formatted date string for the message
             display_str = parsed_date.strftime("%Y-%m-%d")
-            
             if parsed_date >= yesterday:
                 return True, display_str
             else:
@@ -120,6 +118,9 @@ def run():
     db = load_db()
     updated = False
     
+    # Track exactly what IDs we see in this run
+    seen_ids = []
+
     for ad in listings:
         vid = ad.get('data-ad-id')
         if not vid:
@@ -128,6 +129,7 @@ def run():
                 vid = link_elem['href'].split('id=')[1].split('&')[0]
         
         if not vid: continue
+        seen_ids.append(vid)
 
         # Extract Price
         price_tag = ad.find('span', {'data-testid': re.compile(r'price')})
@@ -145,7 +147,6 @@ def run():
         # 1. NEW CAR FOUND
         if vid not in db:
             is_recent, upload_date_str = check_upload_date(ad)
-            
             db[vid] = {"price": price_val, "found_at": now_str}
             updated = True
             
@@ -164,16 +165,28 @@ def run():
 
         # 2. EXISTING CAR (Price Check)
         else:
+            # Safely get old price
             stored_data = db[vid]
-            if isinstance(stored_data, int): old_p = stored_data
-            else: old_p = stored_data.get("price", 0)
+            if isinstance(stored_data, int): 
+                old_p = stored_data
+            else: 
+                old_p = stored_data.get("price", 0)
 
+            # FORCE INTEGER COMPARISON
+            price_val = int(price_val)
+            old_p = int(old_p)
+
+            # DEBUG PRINT FOR COMPARISON
             if old_p != price_val:
-                print(f"CHECK: {vid} | DB: {old_p} -> Web: {price_val}")
+                print(f"DEBUG: COMPARE ID {vid} || DB: {old_p} vs WEB: {price_val}")
 
-            # PRICE DROP (> 50 EUR)
-            if old_p > 0 and price_val > 0 and price_val < (old_p - 50):
-                print(f"ACTION: Sending Drop Alert for {vid}")
+            # CHECK DIFFERENCE
+            diff = price_val - old_p
+
+            # PRICE DROP (New is smaller than Old by > 50)
+            # Example: 45000 - 50000 = -5000.  -5000 < -50 is True.
+            if diff < -50:
+                print(f"ACTION: Sending Drop Alert for {vid} (Diff: {diff})")
                 msg = (
                     f"*📉 Price Drop\\!*\n\n"
                     f"Old: ~{old_p} €~\n"
@@ -187,9 +200,10 @@ def run():
                 else: db[vid] = {"price": price_val, "found_at": now_str}
                 updated = True
 
-            # PRICE INCREASE (> 50 EUR)
-            elif price_val > (old_p + 50):
-                print(f"ACTION: Sending Increase Alert for {vid}")
+            # PRICE INCREASE (New is bigger than Old by > 50)
+            # Example: 55000 - 50000 = 5000. 5000 > 50 is True.
+            elif diff > 50:
+                print(f"ACTION: Sending Increase Alert for {vid} (Diff: {diff})")
                 msg = (
                     f"*📈 Price Increased\\!*\n\n"
                     f"Old: ~{old_p} €~\n"
@@ -208,6 +222,9 @@ def run():
         print("DEBUG: Database saved.")
     else:
         print("DEBUG: No changes detected.")
+    
+    # FINAL DEBUG: Print how many we actually checked
+    print(f"DEBUG: Total IDs checked this run: {len(seen_ids)}")
 
 if __name__ == "__main__":
     run()
