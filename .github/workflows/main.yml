@@ -1,30 +1,47 @@
 name: System Monitor
 
 on:
-  schedule:
+ schedule:
     - cron: '*/5 5-21 * * *'
-  workflow_dispatch:
+ workflow_dispatch:
+
+permissions:
+  contents: write
 
 jobs:
-  run-module:
+  scrape:
     runs-on: ubuntu-latest
-    permissions:
-      contents: write
+
     steps:
-      - uses: actions/checkout@v4
-      - uses: actions/setup-python@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v4
         with:
-          python-version: '3.10'
-      - run: pip install scrapfly-sdk requests beautifulsoup4
-      - name: Execution
+          python-version: '3.9'
+
+      - name: Install dependencies
+        run: |
+          pip install requests beautifulsoup4 scrapfly-sdk
+
+      - name: Run Scraper
         env:
-          SAPK: ${{ secrets.SAPK }}
           TBK: ${{ secrets.TBK }}
           TCI: ${{ secrets.TCI }}
           MBL: ${{ secrets.MBL }}
+          SAPK: ${{ secrets.SAPK }}
         run: python scraper.py
-      - name: Save State
-        uses: stefanzweifel/git-auto-commit-action@v5
-        with:
-          commit_message: "sys-update [skip ci]"
-          file_pattern: 'listings_db.json'
+
+      - name: Commit and Push Seen IDs
+        run: |
+          git config --global user.name "GitHub Action Bot"
+          git config --global user.email "actions@github.com"
+          touch seen_ids.txt
+          git add seen_ids.txt
+          if git diff --staged --quiet; then
+            echo "No changes"
+          else
+            git commit -m "Update seen IDs [skip ci]"
+            git push
+          fi
